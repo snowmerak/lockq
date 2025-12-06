@@ -4,107 +4,39 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 )
 
-// ErrTaskExists is returned when a locked repeating task with the same lock key already exists.
+// Redis hash field names for task data.
+const (
+	taskFieldType        = "ty"
+	taskFieldPayload     = "pl"
+	taskFieldLockKey     = "lk"
+	taskFieldRepeat      = "rp"
+	taskFieldAttempts    = "at"
+	taskFieldMaxAttempts = "ma"
+	taskFieldExecutionID = "ex"
+)
+
 var ErrTaskExists = errors.New("identical repeating task type with same lock key already exists")
 
 // Store handles Redis operations for task persistence and retrieval.
 type Store struct {
 	redis  *redis.Client
 	config *Config
-
-	pushUnlockedSHA  string
-	pushLockedSHA    string
-	popUnlockedSHA   string
-	popLockedSHA     string
-	unlockSHA        string
-	countSHA         string
-	resetAttemptsSHA string
-	releaseLockSHA   string
-	moveToDLQSHA     string
-	deleteTaskSHA    string
-	retryFromDLQSHA  string
-	requeueSHA       string
 }
 
-// NewStore creates a Store instance and preloads Lua scripts into Redis.
+// NewStore creates a Store instance.
 func NewStore(rdb *redis.Client, config *Config) (*Store, error) {
 	config = config.WithDefaults()
-
-	s := &Store{
+	return &Store{
 		redis:  rdb,
 		config: config,
-	}
-
-	ctx := context.Background()
-	var err error
-
-	s.pushUnlockedSHA, err = rdb.ScriptLoad(ctx, pushUnlocked).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load push unlocked script: %w", err)
-	}
-
-	s.pushLockedSHA, err = rdb.ScriptLoad(ctx, pushLocked).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load push locked script: %w", err)
-	}
-
-	s.popUnlockedSHA, err = rdb.ScriptLoad(ctx, popUnlocked).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load pop unlocked script: %w", err)
-	}
-
-	s.popLockedSHA, err = rdb.ScriptLoad(ctx, popLocked).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load pop locked script: %w", err)
-	}
-
-	s.unlockSHA, err = rdb.ScriptLoad(ctx, unlock).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load unlock script: %w", err)
-	}
-
-	s.countSHA, err = rdb.ScriptLoad(ctx, count).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load count script: %w", err)
-	}
-
-	s.resetAttemptsSHA, err = rdb.ScriptLoad(ctx, resetAttempts).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load reset attempts script: %w", err)
-	}
-
-	s.releaseLockSHA, err = rdb.ScriptLoad(ctx, releaseLock).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load release lock script: %w", err)
-	}
-
-	s.moveToDLQSHA, err = rdb.ScriptLoad(ctx, moveToDLQ).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load move to dlq script: %w", err)
-	}
-
-	s.deleteTaskSHA, err = rdb.ScriptLoad(ctx, deleteTask).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load delete task script: %w", err)
-	}
-
-	s.retryFromDLQSHA, err = rdb.ScriptLoad(ctx, retryFromDLQ).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load retry from dlq script: %w", err)
-	}
-
-	s.requeueSHA, err = rdb.ScriptLoad(ctx, requeue).Result()
-	if err != nil {
-		return nil, fmt.Errorf("load requeue script: %w", err)
-	}
-
-	return s, nil
+	}, nil
 }
 
 // Push adds a task to the appropriate queue based on its lock key.
@@ -126,75 +58,140 @@ func (s *Store) Push(ctx context.Context, task *Task) (string, error) {
 
 func (s *Store) pushUnlocked(ctx context.Context, task *Task, delay time.Duration) (string, error) {
 	queueKey := s.config.UnlockedQueueKeyFor(task.Type)
+	taskKey := s.config.TaskKeyPrefix() + task.ID
 
-	result, err := s.redis.EvalSha(
-		ctx,
-		s.pushUnlockedSHA,
-		[]string{queueKey},
-		task.ID,
-		task.Type,
-		task.Payload,
-		delay.Milliseconds(),
-		task.Repeat.Milliseconds(),
-		s.config.TaskKeyPrefix(),
-		task.MaxAttempts,
-	).Result()
+	now := time.Now()
+	score := now.UnixMicro() + delay.Microseconds()
 
+	pipe := s.redis.TxPipeline()
+	pipe.HSet(ctx, taskKey, map[string]interface{}{
+		taskFieldType:        task.Type,
+		taskFieldPayload:     task.Payload,
+		taskFieldMaxAttempts: task.MaxAttempts,
+	})
+	if task.Repeat > 0 {
+		pipe.HSet(ctx, taskKey, taskFieldRepeat, task.Repeat.Milliseconds())
+	}
+	pipe.ZAdd(ctx, queueKey, &redis.Z{Score: float64(score), Member: task.ID})
+
+	_, err := pipe.Exec(ctx)
 	if err != nil {
-		return "", fmt.Errorf("eval push unlocked: %w", err)
+		return "", fmt.Errorf("push unlocked: %w", err)
 	}
 
-	return result.(string), nil
+	return task.ID, nil
 }
 
 func (s *Store) pushLocked(ctx context.Context, task *Task, delay time.Duration) (string, error) {
 	queueKey := s.config.LockedQueueKeyFor(task.Type)
+	taskKey := s.config.TaskKeyPrefix() + task.ID
 
-	result, err := s.redis.EvalSha(
-		ctx,
-		s.pushLockedSHA,
-		[]string{queueKey},
-		task.ID,
-		task.Type,
-		task.Payload,
-		delay.Milliseconds(),
-		task.LockKey,
-		task.Repeat.Milliseconds(),
-		s.config.TaskKeyPrefix(),
-		s.config.RepeatLockKeyPrefix(),
-		task.MaxAttempts,
-	).Result()
+	now := time.Now()
+	score := now.UnixMicro() + delay.Microseconds()
 
-	if err != nil {
-		if errors.Is(err, redis.Nil) {
+	// Check for duplicate repeating task
+	if task.Repeat > 0 && task.LockKey != "" {
+		repeatLockKey := s.config.RepeatLockKeyPrefix() + task.LockKey
+		set, err := s.redis.SetNX(ctx, repeatLockKey, task.ID, 0).Result()
+		if err != nil {
+			return "", fmt.Errorf("check repeat lock: %w", err)
+		}
+		if !set {
 			return "", ErrTaskExists
 		}
-		return "", fmt.Errorf("eval push locked: %w", err)
 	}
 
-	return result.(string), nil
+	pipe := s.redis.TxPipeline()
+	pipe.HSet(ctx, taskKey, map[string]interface{}{
+		taskFieldType:        task.Type,
+		taskFieldPayload:     task.Payload,
+		taskFieldLockKey:     task.LockKey,
+		taskFieldMaxAttempts: task.MaxAttempts,
+	})
+	if task.Repeat > 0 {
+		pipe.HSet(ctx, taskKey, taskFieldRepeat, task.Repeat.Milliseconds())
+	}
+	pipe.ZAdd(ctx, queueKey, &redis.Z{Score: float64(score), Member: task.ID})
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return "", fmt.Errorf("push locked: %w", err)
+	}
+
+	return task.ID, nil
 }
 
 // PopUnlocked retrieves and locks a task from the unlocked queue for the given task type.
 func (s *Store) PopUnlocked(ctx context.Context, taskType string) (*Task, error) {
 	queueKey := s.config.UnlockedQueueKeyFor(taskType)
 
-	result, err := s.redis.EvalSha(
-		ctx,
-		s.popUnlockedSHA,
-		[]string{queueKey},
-		s.config.TaskKeyPrefix(),
-		s.config.LockTimeout.Milliseconds(),
-	).Result()
+	now := time.Now()
+	nowMicro := now.UnixMicro()
 
+	// Fetch one ready task
+	vals, err := s.redis.ZRangeByScoreWithScores(ctx, queueKey, &redis.ZRangeBy{
+		Min:    "-inf",
+		Max:    strconv.FormatInt(nowMicro, 10),
+		Offset: 0,
+		Count:  1,
+	}).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) || err.Error() == "redis: nil" {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("eval pop unlocked: %w", err)
+		return nil, fmt.Errorf("zrangebyscore: %w", err)
+	}
+	if len(vals) == 0 {
+		return nil, nil
 	}
 
-	return s.parseTaskResult(result)
+	taskID := vals[0].Member.(string)
+	taskKey := s.config.TaskKeyPrefix() + taskID
+
+	// Get task metadata
+	fields, err := s.redis.HMGet(ctx, taskKey,
+		taskFieldType, taskFieldPayload, taskFieldRepeat, taskFieldAttempts, taskFieldMaxAttempts).Result()
+	if err != nil {
+		return nil, fmt.Errorf("hmget: %w", err)
+	}
+
+	// Parse fields
+	ty := toString(fields[0])
+	pl := []byte(toString(fields[1]))
+	rpStr := toString(fields[2])
+	atStr := toString(fields[3])
+	mrStr := toString(fields[4])
+
+	repeatMs, _ := strconv.Atoi(rpStr)
+	attempts, _ := strconv.Atoi(atStr)
+	maxRetries, _ := strconv.Atoi(mrStr)
+
+	execID := fmt.Sprintf("%d-%d-%s", now.Unix(), now.Nanosecond()/1000, taskID)
+
+	// Update task in transaction
+	pipe := s.redis.TxPipeline()
+	pipe.HSet(ctx, taskKey, taskFieldExecutionID, execID)
+	pipe.HIncrBy(ctx, taskKey, taskFieldAttempts, 1)
+	if repeatMs > 0 {
+		score := nowMicro + int64(repeatMs)*1000
+		pipe.ZAdd(ctx, queueKey, &redis.Z{Score: float64(score), Member: taskID})
+	} else {
+		pipe.ZRem(ctx, queueKey, taskID)
+		pipe.PExpire(ctx, taskKey, s.config.LockTimeout)
+	}
+
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("update task: %w", err)
+	}
+
+	return &Task{
+		ID:          taskID,
+		Type:        ty,
+		Payload:     pl,
+		LockKey:     "",
+		Repeat:      time.Duration(repeatMs) * time.Millisecond,
+		Attempts:    attempts,
+		MaxAttempts: maxRetries,
+		ExecutionID: execID,
+	}, nil
 }
 
 // PopLocked retrieves and locks a task from the locked queue for the given task type
@@ -202,25 +199,105 @@ func (s *Store) PopUnlocked(ctx context.Context, taskType string) (*Task, error)
 func (s *Store) PopLocked(ctx context.Context, taskType string) (*Task, error) {
 	queueKey := s.config.LockedQueueKeyFor(taskType)
 
-	result, err := s.redis.EvalSha(
-		ctx,
-		s.popLockedSHA,
-		[]string{queueKey},
-		s.config.PeekSize,
-		s.config.FallbackPeekSize,
-		s.config.LockKeyPrefix(),
-		s.config.LockTimeout.Milliseconds(),
-		s.config.TaskKeyPrefix(),
-	).Result()
+	now := time.Now()
+	nowMicro := now.UnixMicro()
 
+	// Try with PeekSize
+	peekSize := s.config.PeekSize
+	vals, err := s.redis.ZRangeByScoreWithScores(ctx, queueKey, &redis.ZRangeBy{
+		Min:    "-inf",
+		Max:    strconv.FormatInt(nowMicro, 10),
+		Offset: 0,
+		Count:  int64(peekSize),
+	}).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) || err.Error() == "redis: nil" {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("eval pop locked: %w", err)
+		return nil, fmt.Errorf("zrangebyscore peek: %w", err)
 	}
 
-	return s.parseTaskResult(result)
+	// If not enough, try FallbackPeekSize
+	if len(vals) == 0 && s.config.FallbackPeekSize > peekSize {
+		vals, err = s.redis.ZRangeByScoreWithScores(ctx, queueKey, &redis.ZRangeBy{
+			Min:    "-inf",
+			Max:    strconv.FormatInt(nowMicro, 10),
+			Offset: 0,
+			Count:  int64(s.config.FallbackPeekSize),
+		}).Result()
+		if err != nil {
+			return nil, fmt.Errorf("zrangebyscore fallback: %w", err)
+		}
+	}
+
+	for _, z := range vals {
+		taskID := z.Member.(string)
+		taskKey := s.config.TaskKeyPrefix() + taskID
+
+		// Get task metadata
+		fields, err := s.redis.HMGet(ctx, taskKey,
+			taskFieldType, taskFieldPayload, taskFieldLockKey, taskFieldRepeat, taskFieldAttempts, taskFieldMaxAttempts).Result()
+		if err != nil {
+			continue
+		}
+
+		lockKeyStr := toString(fields[2])
+		if lockKeyStr == "" {
+			// No lock needed, remove invalid task
+			s.redis.ZRem(ctx, queueKey, taskID)
+			s.redis.Del(ctx, taskKey)
+			continue
+		}
+
+		lockKey := s.config.LockKeyPrefix() + lockKeyStr
+		execID := fmt.Sprintf("%d-%d-%s", now.Unix(), now.Nanosecond()/1000, taskID)
+
+		// Try to acquire lock
+		set, err := s.redis.SetNX(ctx, lockKey, execID, s.config.LockTimeout).Result()
+		if err != nil || !set {
+			continue
+		}
+
+		// Parse fields
+		ty := toString(fields[0])
+		pl := []byte(toString(fields[1]))
+		rpStr := toString(fields[3])
+		atStr := toString(fields[4])
+		mrStr := toString(fields[5])
+
+		repeatMs, _ := strconv.Atoi(rpStr)
+		attempts, _ := strconv.Atoi(atStr)
+		maxRetries, _ := strconv.Atoi(mrStr)
+
+		// Update task in transaction
+		pipe := s.redis.TxPipeline()
+		pipe.HSet(ctx, taskKey, taskFieldExecutionID, execID)
+		pipe.HIncrBy(ctx, taskKey, taskFieldAttempts, 1)
+		if repeatMs > 0 {
+			score := nowMicro + int64(repeatMs)*1000
+			pipe.ZAdd(ctx, queueKey, &redis.Z{Score: float64(score), Member: taskID})
+		} else {
+			pipe.ZRem(ctx, queueKey, taskID)
+			pipe.PExpire(ctx, taskKey, s.config.LockTimeout)
+		}
+
+		_, err = pipe.Exec(ctx)
+		if err != nil {
+			// Release lock on failure
+			s.redis.Del(ctx, lockKey)
+			continue
+		}
+
+		return &Task{
+			ID:          taskID,
+			Type:        ty,
+			Payload:     pl,
+			LockKey:     lockKeyStr,
+			Repeat:      time.Duration(repeatMs) * time.Millisecond,
+			Attempts:    attempts,
+			MaxAttempts: maxRetries,
+			ExecutionID: execID,
+		}, nil
+	}
+
+	return nil, nil
 }
 
 func (s *Store) parseTaskResult(result interface{}) (*Task, error) {
@@ -250,21 +327,25 @@ func (s *Store) parseTaskResult(result interface{}) (*Task, error) {
 func (s *Store) Unlock(ctx context.Context, task *Task) error {
 	taskKey := s.config.TaskKeyPrefix() + task.ID
 
-	_, err := s.redis.EvalSha(
-		ctx,
-		s.unlockSHA,
-		[]string{taskKey},
-		s.config.LockKeyPrefix(),
-		s.config.RepeatLockKeyPrefix(),
-		task.ID,
-		task.ExecutionID,
-	).Result()
-
+	fields, err := s.redis.HMGet(ctx, taskKey, taskFieldRepeat, taskFieldLockKey).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) || err.Error() == "redis: nil" {
-			return nil
+		return fmt.Errorf("hmget unlock: %w", err)
+	}
+
+	rpStr := toString(fields[0])
+	lkStr := toString(fields[1])
+
+	repeatMs, _ := strconv.Atoi(rpStr)
+
+	if repeatMs == 0 {
+		s.redis.Del(ctx, taskKey)
+	}
+
+	if lkStr != "" {
+		lockKey := s.config.LockKeyPrefix() + lkStr
+		if val, _ := s.redis.Get(ctx, lockKey).Result(); val == task.ExecutionID {
+			s.redis.Del(ctx, lockKey)
 		}
-		return fmt.Errorf("eval unlock: %w", err)
 	}
 
 	return nil
@@ -278,20 +359,9 @@ func (s *Store) ReleaseLock(ctx context.Context, task *Task) error {
 
 	lockKey := s.config.LockKeyPrefix() + task.LockKey
 
-	_, err := s.redis.EvalSha(
-		ctx,
-		s.releaseLockSHA,
-		[]string{lockKey},
-		task.ExecutionID,
-	).Result()
-
-	if err != nil {
-		if errors.Is(err, redis.Nil) || err.Error() == "redis: nil" {
-			return nil
-		}
-		return fmt.Errorf("eval release lock: %w", err)
+	if val, err := s.redis.Get(ctx, lockKey).Result(); err == nil && val == task.ExecutionID {
+		return s.redis.Del(ctx, lockKey).Err()
 	}
-
 	return nil
 }
 
@@ -308,13 +378,10 @@ func (s *Store) Requeue(ctx context.Context, task *Task, delay time.Duration) er
 
 	scoreUs := time.Now().Add(delay).UnixMicro()
 
-	_, err := s.redis.EvalSha(
-		ctx,
-		s.requeueSHA,
-		[]string{queueKey, taskKey},
-		scoreUs,
-		task.ID,
-	).Result()
+	pipe := s.redis.TxPipeline()
+	pipe.Persist(ctx, taskKey)
+	pipe.ZAdd(ctx, queueKey, &redis.Z{Score: float64(scoreUs), Member: task.ID})
+	_, err := pipe.Exec(ctx)
 	if err != nil {
 		return fmt.Errorf("requeue task: %w", err)
 	}
@@ -333,36 +400,33 @@ func (s *Store) MoveToDeadLetter(ctx context.Context, task *Task, taskErr error)
 		queueKey = s.config.UnlockedQueueKeyFor(task.Type)
 	}
 
-	isRepeat := "0"
+	failedAt := time.Now().Unix()
+
+	pipe := s.redis.TxPipeline()
+	pipe.Persist(ctx, taskKey)
+	pipe.HSet(ctx, taskKey, "error", taskErr.Error(), "failed_at", failedAt)
+	pipe.ZAdd(ctx, s.config.DeadLetterQueueKey(), &redis.Z{Score: float64(failedAt), Member: task.ID})
+
 	if task.IsRepeat() {
-		isRepeat = "1"
-	}
-	isLocked := "0"
-	if task.IsLocked() {
-		isLocked = "1"
-	}
-
-	_, err := s.redis.EvalSha(
-		ctx,
-		s.moveToDLQSHA,
-		[]string{taskKey},
-		task.ID,
-		queueKey,
-		s.config.DeadLetterQueueKey(),
-		s.config.LockKeyPrefix(),
-		s.config.RepeatLockKeyPrefix(),
-		taskErr.Error(),
-		time.Now().Unix(),
-		isRepeat,
-		isLocked,
-		task.ExecutionID,
-	).Result()
-
-	if err != nil {
-		if errors.Is(err, redis.Nil) || err.Error() == "redis: nil" {
-			return nil
+		pipe.ZRem(ctx, queueKey, task.ID)
+		if task.IsLocked() {
+			lockKey := s.config.LockKeyPrefix() + task.LockKey
+			if val, _ := s.redis.Get(ctx, lockKey).Result(); val == task.ExecutionID {
+				pipe.Del(ctx, lockKey)
+			}
 		}
-		return fmt.Errorf("eval move to dlq: %w", err)
+	}
+
+	if task.IsLocked() {
+		lockKey := s.config.LockKeyPrefix() + task.LockKey
+		if val, _ := s.redis.Get(ctx, lockKey).Result(); val == task.ExecutionID {
+			pipe.Del(ctx, lockKey)
+		}
+	}
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("move to dlq: %w", err)
 	}
 
 	return nil
@@ -383,23 +447,32 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 	lockedQueueKey := s.config.LockedQueueKeyFor(ty)
 	unlockedQueueKey := s.config.UnlockedQueueKeyFor(ty)
 
-	_, err = s.redis.EvalSha(
-		ctx,
-		s.deleteTaskSHA,
-		[]string{taskKey},
-		taskID,
-		lockedQueueKey,
-		unlockedQueueKey,
-		s.config.DeadLetterQueueKey(),
-		s.config.LockKeyPrefix(),
-		s.config.RepeatLockKeyPrefix(),
-	).Result()
-
+	fields, err := s.redis.HMGet(ctx, taskKey, taskFieldLockKey, taskFieldRepeat).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) || err.Error() == "redis: nil" {
-			return nil
+		return fmt.Errorf("hmget: %w", err)
+	}
+
+	lk := toString(fields[0])
+	rp := toString(fields[1])
+
+	pipe := s.redis.TxPipeline()
+	pipe.ZRem(ctx, unlockedQueueKey, taskID)
+	pipe.ZRem(ctx, lockedQueueKey, taskID)
+	pipe.ZRem(ctx, s.config.DeadLetterQueueKey(), taskID)
+	pipe.Del(ctx, taskKey)
+
+	if lk != "" {
+		lockKey := s.config.LockKeyPrefix() + lk
+		pipe.Del(ctx, lockKey)
+		if rp != "" {
+			repeatLockKey := s.config.RepeatLockKeyPrefix() + lk
+			pipe.Del(ctx, repeatLockKey)
 		}
-		return fmt.Errorf("eval delete task: %w", err)
+	}
+
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("delete task: %w", err)
 	}
 
 	return nil
@@ -407,18 +480,13 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 
 // Count returns the number of tasks ready within timeDelta from now.
 func (s *Store) Count(ctx context.Context, queueKey string, timeDelta time.Duration) (int64, error) {
-	result, err := s.redis.EvalSha(
-		ctx,
-		s.countSHA,
-		[]string{queueKey},
-		timeDelta.Milliseconds(),
-	).Result()
-
+	now := time.Now().UnixMicro()
+	max := now + timeDelta.Microseconds()
+	count, err := s.redis.ZCount(ctx, queueKey, "-inf", strconv.FormatInt(max, 10)).Result()
 	if err != nil {
-		return 0, fmt.Errorf("eval count: %w", err)
+		return 0, fmt.Errorf("zcount: %w", err)
 	}
-
-	return result.(int64), nil
+	return count, nil
 }
 
 // CountAll returns the total number of tasks in the queue regardless of scheduled time.
@@ -430,39 +498,58 @@ func (s *Store) CountAll(ctx context.Context, queueKey string) (int64, error) {
 func (s *Store) RetryFromDLQ(ctx context.Context, taskID string) error {
 	taskKey := s.config.TaskKeyPrefix() + taskID
 
+	exists, err := s.redis.Exists(ctx, taskKey).Result()
+	if err != nil {
+		return fmt.Errorf("exists: %w", err)
+	}
+	if exists == 0 {
+		return fmt.Errorf("task %s not found", taskID)
+	}
+
 	ty, err := s.redis.HGet(ctx, taskKey, taskFieldType).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) || err.Error() == "redis: nil" {
-			return fmt.Errorf("task %s not found", taskID)
-		}
-		return fmt.Errorf("lookup task type for retry from dlq: %w", err)
+		return fmt.Errorf("hget type: %w", err)
 	}
 
 	lockedQueueKey := s.config.LockedQueueKeyFor(ty)
 	unlockedQueueKey := s.config.UnlockedQueueKeyFor(ty)
 
-	result, err := s.redis.EvalSha(
-		ctx,
-		s.retryFromDLQSHA,
-		[]string{taskKey},
-		taskID,
-		s.config.DeadLetterQueueKey(),
-		lockedQueueKey,
-		unlockedQueueKey,
-		s.config.RepeatLockKeyPrefix(),
-	).Result()
-
+	fields, err := s.redis.HMGet(ctx, taskKey, taskFieldLockKey, taskFieldRepeat).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) || err.Error() == "redis: nil" {
-			return fmt.Errorf("task %s not found", taskID)
-		}
-		return fmt.Errorf("eval retry from dlq: %w", err)
+		return fmt.Errorf("hmget: %w", err)
 	}
 
-	if m, ok := result.(map[interface{}]interface{}); ok {
-		if errMsg, exists := m["err"]; exists {
-			return fmt.Errorf("%v", errMsg)
+	lk := toString(fields[0])
+	rp := toString(fields[1])
+
+	if rp != "" && lk != "" {
+		repeatLockKey := s.config.RepeatLockKeyPrefix() + lk
+		set, err := s.redis.SetNX(ctx, repeatLockKey, taskID, 0).Result()
+		if err != nil {
+			return fmt.Errorf("setnx repeat lock: %w", err)
 		}
+		if !set {
+			return fmt.Errorf("repeat lock already exists for lock key")
+		}
+	}
+
+	now := time.Now().UnixMicro()
+
+	pipe := s.redis.TxPipeline()
+	pipe.Persist(ctx, taskKey)
+	pipe.HSet(ctx, taskKey, taskFieldAttempts, 0)
+	pipe.HDel(ctx, taskKey, "error", "failed_at")
+	pipe.ZRem(ctx, s.config.DeadLetterQueueKey(), taskID)
+
+	if lk != "" {
+		pipe.ZAdd(ctx, lockedQueueKey, &redis.Z{Score: float64(now), Member: taskID})
+	} else {
+		pipe.ZAdd(ctx, unlockedQueueKey, &redis.Z{Score: float64(now), Member: taskID})
+	}
+
+	_, err = pipe.Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("retry from dlq: %w", err)
 	}
 
 	return nil
@@ -472,22 +559,25 @@ func (s *Store) RetryFromDLQ(ctx context.Context, taskID string) error {
 func (s *Store) ResetAttempts(ctx context.Context, taskID string, executionID string) (bool, error) {
 	taskKey := s.config.TaskKeyPrefix() + taskID
 
-	result, err := s.redis.EvalSha(
-		ctx,
-		s.resetAttemptsSHA,
-		[]string{taskKey},
-		executionID,
-	).Result()
-
+	exists, err := s.redis.Exists(ctx, taskKey).Result()
 	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			return false, nil
-		}
-		return false, fmt.Errorf("eval reset attempts: %w", err)
+		return false, fmt.Errorf("exists: %w", err)
+	}
+	if exists == 0 {
+		return false, nil
 	}
 
-	if result == false {
+	currentExecID, err := s.redis.HGet(ctx, taskKey, taskFieldExecutionID).Result()
+	if err != nil {
+		return false, fmt.Errorf("hget exec id: %w", err)
+	}
+	if currentExecID != executionID {
 		return false, nil
+	}
+
+	err = s.redis.HSet(ctx, taskKey, taskFieldAttempts, 0).Err()
+	if err != nil {
+		return false, fmt.Errorf("hset attempts: %w", err)
 	}
 
 	return true, nil

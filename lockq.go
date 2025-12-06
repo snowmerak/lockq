@@ -346,7 +346,7 @@ func (q *Queue) processTask(task *Task) {
 	err := handler(ctx, task.Payload)
 
 	if err != nil {
-		if task.Attempts+1 < task.MaxAttempts {
+		if task.Attempts < task.MaxAttempts {
 			log.Printf("[lockq] Task %s (type: %s) failed (attempt %d/%d): %v - will retry",
 				task.ID, task.Type, task.Attempts+1, task.MaxAttempts, err)
 
