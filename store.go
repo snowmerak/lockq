@@ -124,74 +124,115 @@ func (s *Store) pushLocked(ctx context.Context, task *Task, delay time.Duration)
 // PopUnlocked retrieves and locks a task from the unlocked queue for the given task type.
 func (s *Store) PopUnlocked(ctx context.Context, taskType string) (*Task, error) {
 	queueKey := s.config.UnlockedQueueKeyFor(taskType)
+	taskKeyPrefix := s.config.TaskKeyPrefix()
 
 	now := time.Now()
 	nowMicro := now.UnixMicro()
 
-	// Fetch one ready task
+	// Try with PeekSize
+	peekSize := s.config.PeekSize
 	vals, err := s.redis.ZRangeByScoreWithScores(ctx, queueKey, &redis.ZRangeBy{
 		Min:    "-inf",
 		Max:    strconv.FormatInt(nowMicro, 10),
 		Offset: 0,
-		Count:  1,
+		Count:  int64(peekSize),
 	}).Result()
 	if err != nil {
-		return nil, fmt.Errorf("zrangebyscore: %w", err)
-	}
-	if len(vals) == 0 {
-		return nil, nil
+		return nil, fmt.Errorf("zrangebyscore peek: %w", err)
 	}
 
-	taskID := vals[0].Member.(string)
-	taskKey := s.config.TaskKeyPrefix() + taskID
-
-	// Get task metadata
-	fields, err := s.redis.HMGet(ctx, taskKey,
-		taskFieldType, taskFieldPayload, taskFieldRepeat, taskFieldAttempts, taskFieldMaxAttempts).Result()
-	if err != nil {
-		return nil, fmt.Errorf("hmget: %w", err)
+	// If not enough, try FallbackPeekSize
+	if len(vals) == 0 && s.config.FallbackPeekSize > peekSize {
+		vals, err = s.redis.ZRangeByScoreWithScores(ctx, queueKey, &redis.ZRangeBy{
+			Min:    "-inf",
+			Max:    strconv.FormatInt(nowMicro, 10),
+			Offset: 0,
+			Count:  int64(s.config.FallbackPeekSize),
+		}).Result()
+		if err != nil {
+			return nil, fmt.Errorf("zrangebyscore fallback: %w", err)
+		}
 	}
 
-	// Parse fields
-	ty := toString(fields[0])
-	pl := []byte(toString(fields[1]))
-	rpStr := toString(fields[2])
-	atStr := toString(fields[3])
-	mrStr := toString(fields[4])
+	for _, z := range vals {
+		taskID := z.Member.(string)
+		taskKey := taskKeyPrefix + taskID
+		claimKey := taskKey + ":claim"
 
-	repeatMs, _ := strconv.Atoi(rpStr)
-	attempts, _ := strconv.Atoi(atStr)
-	maxRetries, _ := strconv.Atoi(mrStr)
+		// Try to claim the task temporarily using SETNX
+		claimed, err := s.redis.SetNX(ctx, claimKey, "claimed", 5*time.Second).Result()
+		if err != nil || !claimed {
+			continue
+		}
 
-	execID := fmt.Sprintf("%d-%d-%s", now.Unix(), now.Nanosecond()/1000, taskID)
+		// Get task metadata
+		fields, err := s.redis.HMGet(ctx, taskKey,
+			taskFieldType, taskFieldPayload, taskFieldRepeat, taskFieldAttempts, taskFieldMaxAttempts).Result()
+		if err != nil {
+			s.redis.Del(ctx, claimKey)
+			continue
+		}
 
-	// Update task in transaction
-	pipe := s.redis.TxPipeline()
-	pipe.HSet(ctx, taskKey, taskFieldExecutionID, execID)
-	pipe.HIncrBy(ctx, taskKey, taskFieldAttempts, 1)
-	if repeatMs > 0 {
-		score := nowMicro + int64(repeatMs)*1000
-		pipe.ZAdd(ctx, queueKey, &redis.Z{Score: float64(score), Member: taskID})
-	} else {
-		pipe.ZRem(ctx, queueKey, taskID)
-		pipe.PExpire(ctx, taskKey, s.config.LockTimeout)
+		// Check if task data exists
+		if fields[0] == nil {
+			s.redis.ZRem(ctx, queueKey, taskID)
+			s.redis.Del(ctx, claimKey)
+			continue
+		}
+
+		// Parse fields
+		ty := toString(fields[0])
+		pl := []byte(toString(fields[1]))
+		rpStr := toString(fields[2])
+		atStr := toString(fields[3])
+		mrStr := toString(fields[4])
+
+		repeatMs, _ := strconv.Atoi(rpStr)
+		attempts, _ := strconv.Atoi(atStr)
+		maxRetries, _ := strconv.Atoi(mrStr)
+
+		execID := fmt.Sprintf("%d-%d-%s", now.Unix(), now.Nanosecond()/1000, taskID)
+
+		// Update task in pipeline
+		pipe := s.redis.TxPipeline()
+		pipe.HSet(ctx, taskKey, taskFieldExecutionID, execID)
+		pipe.HIncrBy(ctx, taskKey, taskFieldAttempts, 1)
+
+		var zremCmd *redis.IntCmd
+		if repeatMs > 0 {
+			score := nowMicro + int64(repeatMs)*1000
+			pipe.ZAdd(ctx, queueKey, &redis.Z{Score: float64(score), Member: taskID})
+		} else {
+			zremCmd = pipe.ZRem(ctx, queueKey, taskID)
+			pipe.PExpire(ctx, taskKey, s.config.LockTimeout)
+		}
+
+		// Release claim lock
+		pipe.Del(ctx, claimKey)
+
+		_, err = pipe.Exec(ctx)
+		if err != nil {
+			continue
+		}
+
+		// If one-off task, verify we actually removed it
+		if repeatMs == 0 && zremCmd != nil && zremCmd.Val() == 0 {
+			continue
+		}
+
+		return &Task{
+			ID:          taskID,
+			Type:        ty,
+			Payload:     pl,
+			LockKey:     "",
+			Repeat:      time.Duration(repeatMs) * time.Millisecond,
+			Attempts:    attempts,
+			MaxAttempts: maxRetries,
+			ExecutionID: execID,
+		}, nil
 	}
 
-	_, err = pipe.Exec(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("update task: %w", err)
-	}
-
-	return &Task{
-		ID:          taskID,
-		Type:        ty,
-		Payload:     pl,
-		LockKey:     "",
-		Repeat:      time.Duration(repeatMs) * time.Millisecond,
-		Attempts:    attempts,
-		MaxAttempts: maxRetries,
-		ExecutionID: execID,
-	}, nil
+	return nil, nil
 }
 
 // PopLocked retrieves and locks a task from the locked queue for the given task type
@@ -414,6 +455,9 @@ func (s *Store) MoveToDeadLetter(ctx context.Context, task *Task, taskErr error)
 			if val, _ := s.redis.Get(ctx, lockKey).Result(); val == task.ExecutionID {
 				pipe.Del(ctx, lockKey)
 			}
+			// Also release the repeat lock so a new task with the same lock key can be enqueued
+			repeatLockKey := s.config.RepeatLockKeyPrefix() + task.LockKey
+			pipe.Del(ctx, repeatLockKey)
 		}
 	}
 

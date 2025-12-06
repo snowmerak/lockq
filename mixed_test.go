@@ -43,6 +43,7 @@ func TestMixed_SequentialExecution(t *testing.T) {
 			Payload: []byte{byte(i)},
 		})
 		require.NoError(t, err)
+		time.Sleep(time.Millisecond) // Ensure distinct timestamps
 	}
 
 	// DETERMINISTIC: Verify all 3 tasks are in queue
