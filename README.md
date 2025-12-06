@@ -6,7 +6,7 @@ Redis-backed task queue for Go with optional distributed locking.
 
 `lockq` gives you a simple way to move slow or unreliable work (emails, webhooks, sync jobs, batch processing, etc.) off your request path into a durable, Redis-backed queue. It lets you control *when* work runs (delayed and repeating tasks), *how often* it is retried (with backoff and DLQ), and *how it is serialized* per key (distributed locking, tasks with the same key never run concurrently), without having to run a separate broker or heavyweight worker framework.
 
-Because all coordination happens through Redis, you can horizontally scale producers and workers across many processes and hosts: they all talk to the same Redis instance or cluster, and the Lua scripts in this package ensure that enqueue, dequeue, locking, and retries are atomic and race-free.
+Because all coordination happens through Redis, you can horizontally scale producers and workers across many processes and hosts: they all talk to the same Redis instance or cluster, and the Go client-side logic ensures that enqueue, dequeue, locking, and retries are handled safely and efficiently using Redis pipelines and optimistic locking.
 
 ## Architecture at a Glance
 
@@ -33,7 +33,7 @@ At a high level, `lockq` looks like this:
         +--------------------------+---------------------------+
                            ^
                  Pop + lock tasks via
-                   atomic Lua scripts
+               client-side orchestration
                            |
         +------------------+------------------+------------------+
         |     Worker A     |     Worker B     |     Worker C     |
@@ -42,7 +42,7 @@ At a high level, `lockq` looks like this:
         +------------------+------------------+------------------+
 ```
 
-This architecture scales horizontally: workers are effectively stateless, keeping only ephemeral in-memory state and delegating all coordination to Redis. You can add or remove worker processes to match load, or run workers alongside your application servers, without changing application logic. Redis and the Lua scripts provide strong guarantees that each task is processed at most once per execution, that per-key locks are respected across all workers, and that retries and DLQ transitions happen atomically.
+This architecture scales horizontally: workers are effectively stateless, keeping only ephemeral in-memory state and delegating all coordination to Redis. You can add or remove worker processes to match load, or run workers alongside your application servers, without changing application logic. Redis and the client-side orchestration provide strong guarantees that each task is processed at most once per execution, that per-key locks are respected across all workers, and that retries and DLQ transitions happen atomically.
 
 ## Features
 
